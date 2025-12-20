@@ -1,6 +1,6 @@
 // Service Worker with Image Caching for dongguaTV
-// v18: Cleaned up debug logs
-const CACHE_VERSION = 'v18';
+// v20: Fixed cross-device progress sync
+const CACHE_VERSION = 'v20';
 const STATIC_CACHE = 'donggua-static-' + CACHE_VERSION;
 const IMAGE_CACHE = 'donggua-images-' + CACHE_VERSION;
 

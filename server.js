@@ -21,9 +21,28 @@ if (!fs.existsSync(IMAGE_CACHE_DIR)) {
     fs.mkdirSync(IMAGE_CACHE_DIR, { recursive: true });
 }
 
-// 访问密码配置
-const ACCESS_PASSWORD = process.env.ACCESS_PASSWORD || '';
-const PASSWORD_HASH = ACCESS_PASSWORD ? crypto.createHash('sha256').update(ACCESS_PASSWORD).digest('hex') : '';
+// 访问密码配置（支持多密码）
+// 格式：ACCESS_PASSWORD=password1 或 ACCESS_PASSWORD=password1,password2,password3
+const ACCESS_PASSWORD_RAW = process.env.ACCESS_PASSWORD || '';
+const ACCESS_PASSWORDS = ACCESS_PASSWORD_RAW ? ACCESS_PASSWORD_RAW.split(',').map(p => p.trim()).filter(p => p) : [];
+
+// 第一个密码的哈希（兼容旧逻辑）
+const PASSWORD_HASH = ACCESS_PASSWORDS.length > 0
+    ? crypto.createHash('sha256').update(ACCESS_PASSWORDS[0]).digest('hex')
+    : '';
+
+// 生成密码到哈希的映射（用于历史同步）
+const PASSWORD_HASH_MAP = {};
+ACCESS_PASSWORDS.forEach((pwd, index) => {
+    const hash = crypto.createHash('sha256').update(pwd).digest('hex');
+    PASSWORD_HASH_MAP[hash] = {
+        index: index,
+        // 第一个密码不启用同步（保持现有设计），其他密码启用同步
+        syncEnabled: index > 0
+    };
+});
+
+console.log(`[System] Password mode: ${ACCESS_PASSWORDS.length > 1 ? 'Multi-user' : 'Single'} (${ACCESS_PASSWORDS.length} passwords)`);
 
 // 远程配置URL
 const REMOTE_DB_URL = process.env.REMOTE_DB_URL || '';
@@ -87,8 +106,20 @@ class CacheManager {
                     )
                 `);
 
+                // 创建用户历史记录表（用于多用户同步）
+                this.db.exec(`
+                    CREATE TABLE IF NOT EXISTS user_history (
+                        user_token TEXT NOT NULL,
+                        item_id TEXT NOT NULL,
+                        item_data TEXT NOT NULL,
+                        updated_at INTEGER NOT NULL,
+                        PRIMARY KEY (user_token, item_id)
+                    )
+                `);
+
                 // 创建索引加速过期查询
                 this.db.exec(`CREATE INDEX IF NOT EXISTS idx_expire ON cache(expire)`);
+                this.db.exec(`CREATE INDEX IF NOT EXISTS idx_history_user ON user_history(user_token)`);
 
                 // 清理过期数据
                 this.db.prepare('DELETE FROM cache WHERE expire < ?').run(Date.now());
@@ -196,6 +227,39 @@ app.use(compression({
 app.use(cors());
 app.use(bodyParser.json());
 
+// ========== API 速率限制 ==========
+const rateLimit = require('express-rate-limit');
+
+// 通用 API 限流：每 IP 每分钟最多 300 次请求
+// 注意：页面加载时会发送多个请求，多设备需要更高的限制
+const apiLimiter = rateLimit({
+    windowMs: 60 * 1000, // 1 分钟窗口
+    max: 300, // 每 IP 最多 300 次（约 5 次/秒）
+    standardHeaders: true, // 返回 RateLimit-* 标准头
+    legacyHeaders: false, // 禁用 X-RateLimit-* 旧头
+    message: { error: '请求过于频繁，请稍后再试 (Rate limit exceeded)' },
+    skip: (req) => {
+        // 跳过静态资源请求和基础配置请求
+        if (!req.path.startsWith('/api/')) return true;
+        // 配置和认证请求不限流（页面加载必需）
+        if (req.path === '/api/config' || req.path === '/api/auth/check' || req.path === '/api/sites') return true;
+        return false;
+    }
+});
+
+// 搜索 API 更严格的限流：每 IP 每分钟最多 60 次搜索
+const searchLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 60,
+    message: { error: '搜索请求过于频繁，请稍后再试' }
+});
+
+// 应用通用限流
+app.use(apiLimiter);
+
+// 对搜索 API 应用更严格的限流
+app.use('/api/search', searchLimiter);
+
 // ========== 静态资源配置 ==========
 
 // 静态资源 30天缓存 (libs 目录 - CSS/JS) - 这些文件不会变化
@@ -233,12 +297,113 @@ app.use(express.static('public', {
 const IS_VERCEL = !!process.env.VERCEL;
 
 app.get('/api/config', (req, res) => {
+    // 检查请求中的 token 是否支持同步
+    const userToken = req.query.token || '';
+    const userInfo = PASSWORD_HASH_MAP[userToken];
+    const syncEnabled = userInfo ? userInfo.syncEnabled : false;
+
     res.json({
         tmdb_api_key: process.env.TMDB_API_KEY,
         tmdb_proxy_url: process.env.TMDB_PROXY_URL,
         // Vercel 环境下禁用本地图片缓存，防止写入报错
-        enable_local_image_cache: !IS_VERCEL
+        enable_local_image_cache: !IS_VERCEL,
+        // 多用户同步功能
+        sync_enabled: syncEnabled,
+        multi_user_mode: ACCESS_PASSWORDS.length > 1
     });
+});
+
+// ========== 历史记录同步 API ==========
+
+// 获取服务器上的历史记录
+app.get('/api/history/pull', (req, res) => {
+    const userToken = req.query.token;
+
+    if (!userToken) {
+        return res.status(400).json({ error: 'Missing token' });
+    }
+
+    // 验证 token 是否有效且启用同步
+    const userInfo = PASSWORD_HASH_MAP[userToken];
+    if (!userInfo) {
+        return res.status(401).json({ error: 'Invalid token' });
+    }
+    if (!userInfo.syncEnabled) {
+        return res.json({ sync_enabled: false, history: [] });
+    }
+
+    // 从 SQLite 获取历史记录
+    if (cacheManager.type !== 'sqlite' || !cacheManager.db) {
+        return res.json({ sync_enabled: true, history: [], message: 'SQLite not available' });
+    }
+
+    try {
+        const stmt = cacheManager.db.prepare('SELECT item_id, item_data, updated_at FROM user_history WHERE user_token = ?');
+        const rows = stmt.all(userToken);
+
+        const history = rows.map(row => ({
+            id: row.item_id,
+            data: JSON.parse(row.item_data),
+            updated_at: row.updated_at
+        }));
+
+        res.json({ sync_enabled: true, history: history });
+    } catch (e) {
+        console.error('[History Pull Error]', e.message);
+        res.status(500).json({ error: 'Database error' });
+    }
+});
+
+// 推送历史记录到服务器
+app.post('/api/history/push', (req, res) => {
+    const { token, history } = req.body;
+
+    if (!token || !Array.isArray(history)) {
+        return res.status(400).json({ error: 'Missing token or history' });
+    }
+
+    // 验证 token
+    const userInfo = PASSWORD_HASH_MAP[token];
+    if (!userInfo) {
+        return res.status(401).json({ error: 'Invalid token' });
+    }
+    if (!userInfo.syncEnabled) {
+        return res.json({ sync_enabled: false, saved: 0 });
+    }
+
+    // 保存到 SQLite
+    if (cacheManager.type !== 'sqlite' || !cacheManager.db) {
+        return res.json({ sync_enabled: true, saved: 0, message: 'SQLite not available' });
+    }
+
+    try {
+        const insertStmt = cacheManager.db.prepare(`
+            INSERT OR REPLACE INTO user_history (user_token, item_id, item_data, updated_at)
+            VALUES (?, ?, ?, ?)
+        `);
+
+        let saved = 0;
+        const transaction = cacheManager.db.transaction((items) => {
+            for (const item of items) {
+                if (item.id && item.data) {
+                    insertStmt.run(
+                        token,
+                        item.id,
+                        JSON.stringify(item.data),
+                        item.updated_at || Date.now()
+                    );
+                    saved++;
+                }
+            }
+        });
+
+        transaction(history);
+
+        res.json({ sync_enabled: true, saved: saved });
+    } catch (e) {
+        console.error('[History Push Error]', e.message);
+        res.status(500).json({ error: 'Database error' });
+    }
 });
 
 // TMDB 通用代理与缓存 API
@@ -630,19 +795,23 @@ function cleanCacheIfNeeded() {
 
 // 5. 认证检查 API
 app.get('/api/auth/check', (req, res) => {
-    // 简单检查 header 中的 token (示例：实际需更强验证)
-    // 这里简单返回是否需要密码
-    res.json({ requirePassword: !!ACCESS_PASSWORD });
+    // 检查是否需要密码
+    res.json({
+        requirePassword: ACCESS_PASSWORDS.length > 0,
+        multiUserMode: ACCESS_PASSWORDS.length > 1
+    });
 });
 
-// 6. 验证密码 API
+// 6. 验证密码 API（支持多密码）
 app.post('/api/auth/verify', (req, res) => {
     const { password, passwordHash } = req.body;
-    if (!ACCESS_PASSWORD) return res.json({ success: true });
 
-    // 支持两种验证方式：
-    // 1. 前端发送原始密码 (password) - 后端哈希后比较
-    // 2. 前端发送哈希值 (passwordHash) - 直接比较
+    // 无密码保护时直接通过
+    if (ACCESS_PASSWORDS.length === 0) {
+        return res.json({ success: true, syncEnabled: false });
+    }
+
+    // 计算输入的哈希值
     let inputHash;
     if (passwordHash) {
         inputHash = passwordHash;
@@ -652,8 +821,17 @@ app.post('/api/auth/verify', (req, res) => {
         return res.json({ success: false });
     }
 
-    if (inputHash === PASSWORD_HASH) {
-        res.json({ success: true, token: 'session_token_placeholder', passwordHash: PASSWORD_HASH });
+    // 检查是否匹配任一密码
+    const userInfo = PASSWORD_HASH_MAP[inputHash];
+    if (userInfo !== undefined) {
+        // 密码有效
+        res.json({
+            success: true,
+            passwordHash: inputHash,
+            // 同步功能状态
+            syncEnabled: userInfo.syncEnabled,
+            userIndex: userInfo.index
+        });
     } else {
         res.json({ success: false });
     }
