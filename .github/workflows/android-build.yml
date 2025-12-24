@@ -2,7 +2,19 @@ name: Android Build & Release
 
 on:
   workflow_dispatch:
-
+   inputs:
+      server_url:
+        description: 'Server URL (e.g. https://your-site.com)'
+        required: true
+        default: 'http://192.168.31.200:3003'
+      app_name:
+        description: '影视小库'
+        required: true
+        default: 'E视界'
+      version_tag:
+        description: 'Version Tag (e.g. v1.0.0)'
+        required: true
+        default: 'v1.0.0'
 jobs:
   build:
     runs-on: ubuntu-latest
